@@ -1,0 +1,91 @@
+---
+- name: Retrieve cluster nodes list
+  shell: >
+        kubectl get nodes -o=jsonpath='{.items[*].metadata.name}'
+  delegate_to: "{{ groups['controlplane'][0] }}"
+  register: cluster_nodes_list_output
+  changed_when: false
+
+- name: Set variable to join cluster
+  set_fact:
+    join_cluster: "{{ false if hostvars[inventory_hostname]['ansible_facts']['hostname'] in cluster_nodes_list_output.stdout else true }}"
+  changed_when: false
+
+- name: Look for kubeadm token
+  shell: kubeadm token list -o json | jq '.token, .usages' | grep "authentication" -B2 | head -n1 | tr -d \"
+  delegate_to: "{{ groups['controlplane'][0] }}"
+  register: token_list_output
+  changed_when: false
+  when: join_cluster
+
+- name: See token_list_output
+  debug: 
+    var: token_list_output
+
+- name: Set variable to create token or not
+  set_fact:
+    create_token: "{{ true if token_list_output.stdout == '' else false }}"
+  changed_when: false
+  when: join_cluster
+
+- name: See create_token
+  debug: 
+    var: create_token
+
+- name: Create kubeadm token
+  shell: >
+        kubeadm token create --description "Ansible generated" --groups "system:bootstrappers:kubeadm:default-node-token" --ttl 24h0m0s --usages "signing,authentication"
+  delegate_to: "{{ groups['controlplane'][0] }}"
+  register: token_create_output
+  changed_when: false
+  when: create_token|default(false) and join_cluster
+
+- name: See token_create_output
+  debug: 
+    var: token_create_output
+
+- name: Retrieve token-ca-cert-hash
+  shell: >
+        openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt 
+        | openssl rsa -pubin -outform der 2>/dev/null 
+        | openssl dgst -sha256 -hex 
+        | sed 's/^.* //'
+  delegate_to: "{{ groups['controlplane'][0] }}"
+  register: token_ca_cert_hash
+  changed_when: false
+  when: join_cluster
+
+- name: Join cluster with existing token
+  shell: kubeadm join "{{ kubernetes_apiserver_advertise_address }}":"{{ kubernetes_apiserver_bind_port }}" --token "{{ token_list_output.stdout }}" --discovery-token-ca-cert-hash sha256:"{{ token_ca_cert_hash.stdout }}"
+  when: not create_token|default(false) and join_cluster and inventory_hostname in groups['nodes']
+
+- name: Join cluster with created token
+  shell: kubeadm join "{{ kubernetes_apiserver_advertise_address }}":"{{ kubernetes_apiserver_bind_port }}" --token "{{ token_create_output.stdout }}" --discovery-token-ca-cert-hash sha256:"{{ token_ca_cert_hash.stdout }}"
+  when: create_token|default(false) and join_cluster and inventory_hostname in groups['nodes']
+
+- name: Check if kubectl is configured
+  stat:
+    path: /root/.kube/config
+  register: kubectl_configured
+  when: inventory_hostname in groups['nodes']
+
+- name: Create directory for kubectl config for root
+  file:
+    path: /root/.kube
+    state: directory
+  when: inventory_hostname in groups['nodes'] and not kubectl_configured.stat.exists 
+
+- name: Retrieve kubectl config
+  shell: >
+        cat /root/.kube/config
+  delegate_to: "{{ groups['controlplane'][0] }}"
+  register: kubectl_config
+  changed_when: false
+  when: inventory_hostname in groups['nodes'] and not kubectl_configured.stat.exists 
+
+- name: Add kubectl config
+  copy:
+    content: "{{kubectl_config.stdout}}\n"
+    dest: /root/.kube/config
+  when: inventory_hostname in groups['nodes'] and not kubectl_configured.stat.exists
+...

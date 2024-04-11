@@ -1,2 +1,8 @@
 ---
-# tasks file for kubernetes
+- include_tasks: 1-nodes-init.yaml
+- include_tasks: 2-cluster-init.yaml
+- include_tasks: 3-nodes-join-cluster.yaml
+- include_tasks: 4-calico-install.yaml
+- include_tasks: 5-calico-deactivate-node-to-node-mesh.yaml
+  when: kubernetes_calico_deactivate_node_to_node_mesh
+...

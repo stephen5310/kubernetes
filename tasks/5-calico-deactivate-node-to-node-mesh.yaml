@@ -1,0 +1,88 @@
+---   
+- name: export node yaml config to file
+  shell: >
+        /usr/local/sbin/calicoctl --allow-version-mismatch 
+        get node {{ hostvars[inventory_hostname]['ansible_facts']['hostname'] }} 
+        -o yaml --export > /tmp/node.yaml
+  changed_when: false
+
+- name: check if route reflectors are configured
+  lineinfile: 
+    path: /tmp/node.yaml
+    regex: '^    calico-route-reflector:'
+    state: absent
+  check_mode: true
+  register: rr_config_check
+  changed_when: false
+
+- name: set variable to configure route reflectors
+  set_fact:
+    rr_configured: "{{ false if rr_config_check.found == 0 else true }}"
+  changed_when: false
+
+- name: add route reflector configuration
+  lineinfile:
+    path: /tmp/node.yaml
+    regexp: "{{ item.regexp }}"
+    insertafter: "{{ item.insertafter }}"
+    line: "{{ item.line }}"
+  when: not rr_configured and inventory_hostname in groups['route_reflectors']
+  with_items:
+    - {regexp: '^    calico-route-reflector:', insertafter: '^  labels:', line: "    calico-route-reflector: ''"}
+    - {regexp: '^    routeReflectorClusterID:', insertafter: '^  bgp:', line: '    routeReflectorClusterID: 224.0.0.1'}
+ 
+- name: apply the changes
+  shell: >
+        /usr/local/sbin/calicoctl --allow-version-mismatch 
+        apply -f /tmp/node.yaml
+  register: output
+  when: not rr_configured and inventory_hostname in groups['route_reflectors']
+
+- name: copy calico bgp config files to nodes
+  copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+  when: "{{ item.when }} and not rr_configured"
+  with_items:
+    - {src: 'calico-nonrr-rr.yaml', dest: '/tmp/calico-nonrr-rr.yaml', when: "inventory_hostname not in groups['route_reflectors']"}
+    - {src: 'calico-rr-rr.yaml', dest: '/tmp/calico-rr-rr.yaml', when: "inventory_hostname in groups['route_reflectors']"}
+
+- name: configure non reflector to reflector pairing
+  shell: >
+        /usr/local/sbin/calicoctl --allow-version-mismatch 
+        apply -f /tmp/calico-nonrr-rr.yaml
+  when: "inventory_hostname not in groups['route_reflectors'] and not rr_configured"
+  register: output
+  changed_when: "{{ 'Successfully applied' in output.stdout }}"
+
+- name: configure reflector to reflector pairing
+  shell: >
+        /usr/local/sbin/calicoctl --allow-version-mismatch 
+        apply -f /tmp/calico-rr-rr.yaml
+  when: "inventory_hostname in groups['route_reflectors'] and not rr_configured"
+  register: output
+  changed_when: "{{ 'Successfully applied' in output.stdout }}"
+
+- name: check if bgp is configured and node to node mesh is disabled
+  shell: >
+        /usr/local/sbin/calicoctl --allow-version-mismatch get bgpConfiguration
+  register: bgp_config
+  changed_when: false
+
+- name: set variable to disable node-to-node mesh
+  set_fact:
+    disable_n2n_mesh: "{{ false if 'default' in bgp_config.stdout|default('') and 'false' in bgp_config.stdout|default('') else true }}"
+  changed_when: false
+
+- name: copy calico mesh deactivation config file to nodes
+  copy:
+    src: calico-disable-mesh.yaml
+    dest: /tmp/calico-disable-mesh.yaml
+  when: "disable_n2n_mesh and inventory_hostname == groups['controlplane'][0]"
+
+- name: disable node-to-node mesh
+  shell: >
+        /usr/local/sbin/calicoctl --allow-version-mismatch 
+        create -f /tmp/calico-disable-mesh.yaml
+  when: "disable_n2n_mesh and inventory_hostname == groups['controlplane'][0]"
+...

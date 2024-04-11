@@ -1,0 +1,54 @@
+---
+- name: Check if cluster is initialized
+  shell: ss -lntp | grep "{{ kubernetes_apiserver_bind_port }}"
+  register: cluster_init_check
+  failed_when: false
+  changed_when: false
+  when: inventory_hostname == groups['controlplane'][0]
+
+- name: Set variable to initialize cluster
+  set_fact:
+    cluster_not_initialized: "{{ false if 'LISTEN' in cluster_init_check.stdout|default('') else true }}"
+  changed_when: false
+  delegate_to: "{{groups['controlplane'][0]}}"
+
+- name: Initialize the cluster
+  shell: >
+      kubeadm init 
+      --apiserver-advertise-address "{{ kubernetes_apiserver_advertise_address }}" 
+      --apiserver-bind-port "{{ kubernetes_apiserver_bind_port }}"
+      --cri-socket "{{ kubernetes_cri_socket }}" 
+      --image-repository "{{ kubernetes_image_repository }}"
+      --node-name "{{ kubernetes_node_name }}"
+      --kubernetes-version "{{ kubernetes_version }}" 
+      --pod-network-cidr "{{ kubernetes_pod_network_cidr }}" 
+      --service-cidr "{{ kubernetes_service_cidr }}"
+      --service-dns-domain "{{ kubernetes_service_dns_domain }}"
+      --skip-certificate-key-print
+      --skip-token-print
+      --upload-certs
+  when: cluster_not_initialized and inventory_hostname == groups['controlplane'][0]
+
+- name: Create kubernetes config directories
+  file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.user }}"
+    group: "{{ item.user }}"
+  with_items:
+    - {path: '/root/.kube', user: 'root'}
+    - {path: '/home/{{ kubernetes_remote_user }}/.kube', user: "{{ kubernetes_remote_user }}"}
+  when: inventory_hostname == groups['controlplane'][0]
+
+- name: Set kubectl configuration
+  copy:
+    src: /etc/kubernetes/admin.conf
+    remote_src: yes
+    dest: "{{ item.dest }}"
+    owner: "{{ item.user }}"
+    group: "{{ item.user }}"
+  with_items:
+    - {dest: '/root/.kube/config', user: 'root'}
+    - {dest: '/home/{{ kubernetes_remote_user }}/.kube/config', user: "{{ kubernetes_remote_user }}"}
+  when: inventory_hostname == groups['controlplane'][0]
+...
