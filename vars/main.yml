@@ -1,2 +1,28 @@
 ---
-# vars file for kubernetes
+kubernetes_linux_kernel_modules:
+  - overlay
+  - br_netfilter
+kubernetes_linux_network_options:
+  - {name: 'net.bridge.bridge-nf-call-iptables', value: '1'}
+  - {name: 'net.bridge.bridge-nf-call-ip6tables', value: '1'}
+  - {name: 'net.ipv4.ip_forward', value: '1'}
+kubernetes_yum_repositories:
+  - {name: 'docker-ce',description: 'Docker engine repo',
+      baseurl: 'https://download.docker.com/linux/centos/$releasever/$basearch/stable',
+      gpgkey: 'https://download.docker.com/linux/centos/gpg',gpgcheck: 'yes',
+      repo_gpgcheck: 'yes', exclude: '' }
+  - {name: 'kubernetes',description: 'Kubernetes repo',
+      baseurl: 'https://pkgs.k8s.io/core:/stable:/v1.29/rpm/',
+      gpgkey: 'https://pkgs.k8s.io/core:/stable:/v1.29/rpm/repodata/repomd.xml.key',
+      gpgcheck: 'yes',repo_gpgcheck: 'yes',
+      exclude: 'kubelet kubeadm kubectl cri-tools kubernetes-cni' }
+kubernetes_packages:
+  - {name: 'containerd', disable_excludes: ''}
+  - {name: 'jq', disable_excludes: ''}
+  - {name: 'kubelet', disable_excludes: 'kubernetes'}
+  - {name: 'kubeadm', disable_excludes: 'kubernetes'}
+  - {name: 'kubectl', disable_excludes: 'kubernetes'}
+kubernetes_services:
+  - {name: 'containerd', state: 'started'}
+  - {name: 'kubelet', state: 'started'}
+...

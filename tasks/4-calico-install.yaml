@@ -1,0 +1,294 @@
+---
+- name: install pre-requisites
+  pip:
+    name:
+      - openshift
+      - pyyaml
+      - kubernetes 
+
+- name: Create Calico custom resources
+  k8s:
+    src: "{{ kubernetes_calico_crds_definition }}"
+    state: present
+  when: inventory_hostname == groups['controlplane'][0]
+
+- name: Install calicoctl
+  get_url:
+    url: "{{ kubernetes_calico_calicoctl_download_url }}"
+    dest: /usr/local/sbin/calicoctl
+    mode: '0555'
+
+- name: Add alias for calicoctl to allow version mismatch
+  lineinfile:
+    path: /root/.bashrc
+    regexp: '^alias calicoctl='
+    line: "alias calicoctl='calicoctl --allow-version-mismatch'"
+
+- name: Create ippools files
+  copy:
+    src: "{{ item }}"
+    dest: /tmp/{{ item }}
+  when: inventory_hostname == groups['controlplane'][0]
+  with_items: "{{ kubernetes_calico_ippools_definitions }}"
+
+- name: Create ippools
+  shell: >
+        /usr/local/sbin/calicoctl --allow-version-mismatch 
+        create -f /tmp/{{ item }}
+  when: inventory_hostname == groups['controlplane'][0]
+  register: output
+  failed_when: output.rc > 1
+  changed_when: output.rc == 0
+  with_items: "{{ kubernetes_calico_ippools_definitions }}"
+
+- name: Check for calico cert
+  stat:
+    path: "{{ kubernetes_calico_certs_dir }}/cni.crt"
+  register: calico_cert
+  when: inventory_hostname == groups['controlplane'][0]
+
+- name: Create key for calico and sign it
+  shell: >
+    openssl req -newkey rsa:4096 -keyout {{ kubernetes_calico_certs_dir }}/cni.key 
+    -nodes -out {{ kubernetes_calico_certs_dir }}/cni.csr -subj "/CN=calico-cni" 
+    && openssl x509 -req -in {{ kubernetes_calico_certs_dir }}/cni.csr -CA /etc/kubernetes/pki/ca.crt 
+    -CAkey /etc/kubernetes/pki/ca.key -CAcreateserial -out {{ kubernetes_calico_certs_dir }}/cni.crt -days 365
+  when: inventory_hostname == groups['controlplane'][0] and not calico_cert.stat.exists
+
+- name: Check for cni kubeconfig
+  stat:
+    path: "{{ kubernetes_cni_conf_dir }}/calico-kubeconfig"
+  register: cni_kubeconfig_check
+
+- name: Create cni kubeconfig
+  shell: >
+    kubectl config set-cluster kubernetes
+    --certificate-authority=/etc/kubernetes/pki/ca.crt
+    --embed-certs=true
+    --server=https://"{{ ansible_ssh_host }}":6443
+    --kubeconfig=/tmp/cni.kubeconfig
+    && kubectl config set-credentials calico-cni
+    --client-certificate={{ kubernetes_calico_certs_dir }}/cni.crt
+    --client-key={{ kubernetes_calico_certs_dir }}/cni.key
+    --embed-certs=true
+    --kubeconfig=/tmp/cni.kubeconfig
+    && kubectl config set-context default \
+    --cluster=kubernetes \
+    --user=calico-cni \
+    --kubeconfig=/tmp/cni.kubeconfig
+    && kubectl config use-context default --kubeconfig=/tmp/cni.kubeconfig
+  when: inventory_hostname == groups['controlplane'][0] and not cni_kubeconfig_check.stat.exists
+
+- name: Create RBAC for calico
+  k8s:
+    definition: "{{ lookup('file', 'calico-rbac.yaml') | from_yaml_all }}"
+    state: present
+  when: inventory_hostname == groups['controlplane'][0]
+
+- name: Bind cluster role to the calico-cni account
+  shell: >
+        kubectl create clusterrolebinding calico-cni 
+        --clusterrole=calico-cni --user=calico-cni
+  when: inventory_hostname == groups['controlplane'][0]
+  register: output
+  failed_when: output.rc > 1
+  changed_when: output.rc == 0
+
+- name: Check for calico bin
+  stat:
+    path: /opt/cni/bin/calico
+  register: calico_bin_check
+
+- name: Check for calico-ipam bin
+  stat:
+    path: /opt/cni/bin/calico-ipam
+  register: calico_ipam_bin_check
+
+- name: Install cni plugin binaries
+  get_url:
+    url: "{{ item.url }}"
+    dest: "{{ item.dest }}"
+    mode: '0755'
+  when: "{{ item.when }}"
+  register: plugins_install
+  retries: 3
+  delay: 2
+  until: '"OK" in plugins_install.msg'
+  with_items:
+    - {dest: '/opt/cni/bin/calico', url: 'https://github.com/projectcalico/cni-plugin/releases/download/v3.14.0/calico-amd64', when: "{{not calico_bin_check.stat.exists}}"}
+    - {dest: '/opt/cni/bin/calico-ipam', url: 'https://github.com/projectcalico/cni-plugin/releases/download/v3.14.0/calico-ipam-amd64' , when: "{{not calico_ipam_bin_check.stat.exists}}"}
+
+- name: Set cni kubeconfig var
+  shell: >
+        cat /tmp/cni.kubeconfig
+  register: cni_kubeconfig
+  when: not cni_kubeconfig_check.stat.exists
+  delegate_to: "{{ groups['controlplane'][0] }}"
+
+- name: Create cni networks conf directory
+  file:
+    path: "{{ kubernetes_cni_conf_dir }}"
+    state: directory
+  when: not cni_kubeconfig_check.stat.exists
+
+- name: Create cni kubeconfig configuration
+  copy:
+    content: "{{cni_kubeconfig.stdout}}\n"
+    dest: "{{ kubernetes_cni_conf_dir }}/calico-kubeconfig"
+    mode: '0600'
+  when: not cni_kubeconfig_check.stat.exists
+
+- name: Write cni configuration
+  copy:
+    src: 10-calico.conflist
+    dest: /tmp/10-calico.conflist
+
+- name: Check for cni configuration
+  stat:
+    path: "{{ kubernetes_cni_conf_dir }}/10-calico.conflist"
+  register: calico_config_check
+
+- name: Activate cni configuration #Creating the file directly in the folder does not work somehow
+  copy:
+    src: /tmp/10-calico.conflist
+    dest: "{{ kubernetes_cni_conf_dir }}/10-calico.conflist"
+    remote_src: yes
+  when: not calico_config_check.stat.exists
+
+- name: Check for typha CA cert
+  stat:
+    path: "{{ kubernetes_calico_certs_dir }}/typhaca.crt"
+  register: typhaca_cert
+  when: inventory_hostname == groups['controlplane'][0]
+
+- name: Create cert for typha CA
+  shell: >
+        openssl req -x509 -newkey rsa:4096 -keyout {{ kubernetes_calico_certs_dir }}/typhaca.key 
+        -nodes -out {{ kubernetes_calico_certs_dir }}/typhaca.crt -subj "/CN=Calico Typha CA" -days 365
+  when: inventory_hostname == groups['controlplane'][0] and not typhaca_cert.stat.exists
+
+- name: Create configmap for typha CA
+  shell: >
+        kubectl create configmap -n kube-system calico-typha-ca 
+        --from-file={{ kubernetes_calico_certs_dir }}/typhaca.crt
+  when: inventory_hostname == groups['controlplane'][0]
+  register: output
+  failed_when: output.rc > 1
+  changed_when: output.rc == 0
+
+- name: Check for typha cert
+  stat:
+    path: "{{ kubernetes_calico_certs_dir }}/typha.crt"
+  register: typha_cert
+  when: inventory_hostname == groups['controlplane'][0]
+
+- name: Create key for typha and sign it
+  shell: >
+    openssl req -newkey rsa:4096 -keyout {{ kubernetes_calico_certs_dir }}/typha.key 
+    -nodes -out {{ kubernetes_calico_certs_dir }}/typha.csr -subj "/CN=calico-typha"
+    && openssl x509 -req -in {{ kubernetes_calico_certs_dir }}/typha.csr 
+    -CA {{ kubernetes_calico_certs_dir }}/typhaca.crt -CAkey {{ kubernetes_calico_certs_dir }}/typhaca.key 
+    -CAcreateserial -out {{ kubernetes_calico_certs_dir }}/typha.crt -days 365
+  when: inventory_hostname == groups['controlplane'][0] and not typha_cert.stat.exists
+
+- name: Create secret for typha key and cert
+  shell: >
+        kubectl create secret generic -n kube-system calico-typha-certs 
+        --from-file={{ kubernetes_calico_certs_dir }}/typha.key 
+        --from-file={{ kubernetes_calico_certs_dir }}/typha.crt
+  when: inventory_hostname == groups['controlplane'][0]
+  register: output
+  failed_when: output.rc > 1
+  changed_when: output.rc == 0
+
+- name: Create service account for typha
+  shell: >
+        kubectl create serviceaccount -n kube-system calico-typha
+  when: inventory_hostname == groups['controlplane'][0]
+  register: output
+  failed_when: output.rc > 1
+  changed_when: output.rc == 0
+
+- name: Create cluster role for typha
+  k8s:
+    definition: "{{ lookup('file', 'typha-rbac.yaml') | from_yaml_all }}"
+    state: present
+  when: inventory_hostname == groups['controlplane'][0]
+
+- name: Bind typha service account with cluster role
+  shell: >
+        kubectl create clusterrolebinding calico-typha 
+        --clusterrole=calico-typha 
+        --serviceaccount=kube-system:calico-typha
+  when: inventory_hostname == groups['controlplane'][0]
+  register: output
+  failed_when: output.rc > 1
+  changed_when: output.rc == 0
+
+- name: Create typha deployment
+  k8s:
+    definition: "{{ lookup('file', 'typha-deployment.yaml') | from_yaml_all }}"
+    state: present
+  when: inventory_hostname == groups['controlplane'][0]
+
+- name: Create calico typha service
+  k8s:
+    definition: "{{ lookup('file', 'calico-node-svc.yaml') | from_yaml_all }}"
+    state: present
+  when: inventory_hostname == groups['controlplane'][0]
+
+- name: Check for calico/node cert
+  stat:
+    path: "{{ kubernetes_calico_certs_dir }}/calico-node.crt"
+  register: calico_node_cert
+  when: inventory_hostname == groups['controlplane'][0]
+
+- name: Create key for calico/node and sign it
+  shell: >
+    openssl req -newkey rsa:4096 -keyout {{ kubernetes_calico_certs_dir }}/calico-node.key 
+    -nodes -out {{ kubernetes_calico_certs_dir }}/calico-node.csr -subj "/CN=calico-node"
+    && openssl x509 -req -in {{ kubernetes_calico_certs_dir }}/calico-node.csr 
+    -CA {{ kubernetes_calico_certs_dir }}/typhaca.crt -CAkey {{ kubernetes_calico_certs_dir }}/typhaca.key 
+    -CAcreateserial -out {{ kubernetes_calico_certs_dir }}/calico-node.crt -days 365
+  when: inventory_hostname == groups['controlplane'][0] and not calico_node_cert.stat.exists
+
+- name: Create secret for calico/node key and cert
+  shell: >
+        kubectl create secret generic -n kube-system calico-node-certs 
+        --from-file={{ kubernetes_calico_certs_dir }}/calico-node.key 
+        --from-file={{ kubernetes_calico_certs_dir }}/calico-node.crt
+  when: inventory_hostname == groups['controlplane'][0]
+  register: output
+  failed_when: output.rc > 1
+  changed_when: output.rc == 0
+
+- name: Create service account for calico/node
+  shell: >
+        kubectl create serviceaccount -n kube-system calico-node
+  when: inventory_hostname == groups['controlplane'][0]
+  register: output
+  failed_when: output.rc > 1
+  changed_when: output.rc == 0
+
+- name: Create cluster role for typha
+  k8s:
+    definition: "{{ lookup('file', 'calico-node-rbac.yaml') | from_yaml_all }}"
+    state: present
+  when: inventory_hostname == groups['controlplane'][0]
+
+- name: Bind calico/node SA with CR
+  shell: >
+        kubectl create clusterrolebinding calico-node 
+        --clusterrole=calico-node 
+        --serviceaccount=kube-system:calico-node
+  when: inventory_hostname == groups['controlplane'][0]
+  register: output
+  failed_when: output.rc > 1
+  changed_when: output.rc == 0
+
+- name: Install calico/node daemonset
+  k8s:
+    definition: "{{ lookup('file', 'calico-node-ds.yaml') | from_yaml_all }}"
+    state: present
+  when: inventory_hostname == groups['controlplane'][0]
+...

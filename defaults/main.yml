@@ -1,2 +1,21 @@
 ---
-# defaults file for kubernetes
+kubernetes_remote_user: vagrant
+kubernetes_version: '1.29.3'
+kubernetes_node_hostname: "{{ inventory_hostname }}"
+kubernetes_apiserver_advertise_address: "{{ hostvars[groups['controlplane'][0]]['ansible_ssh_host'] }}"
+kubernetes_apiserver_bind_port: 6443
+kubernetes_cri_socket: "unix:///var/run/containerd/containerd.sock"
+kubernetes_image_repository: "registry.k8s.io"
+kubernetes_node_name: "{{ hostvars[inventory_hostname]['ansible_facts']['hostname'] }}"
+kubernetes_pod_network_cidr: "10.10.0.0/16"
+kubernetes_service_cidr: "10.96.0.0/12"
+kubernetes_service_dns_domain: "cluster.local"
+kubernetes_calico_crds_definition: "https://raw.githubusercontent.com/projectcalico/calico/v3.27.2/manifests/crds.yaml"
+kubernetes_calico_calicoctl_download_url: "https://github.com/projectcalico/calico/releases/latest/download/calicoctl-linux-amd64"
+kubernetes_calico_ippools_definitions:
+  - pool1.yaml
+  - pool2.yaml
+kubernetes_calico_certs_dir: "/etc/kubernetes/pki"
+kubernetes_cni_conf_dir: "/etc/cni/net.d"
+kubernetes_calico_deactivate_node_to_node_mesh: "{{ true if groups['route_reflectors'] is defined and groups['route_reflectors']|length > 1 else false}}"
+...

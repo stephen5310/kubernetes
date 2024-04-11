@@ -1,0 +1,132 @@
+---
+- name: Add name resolution
+  blockinfile:
+    path: /etc/hosts
+    block: |        
+      {% for host in groups['all'] %}
+      {{ hostvars[host]['ansible_ssh_host'] }} {{ host }}
+      {% endfor %}
+
+- name: Configure node hostname
+  hostname:
+    name: "{{ kubernetes_node_hostname }}"
+    use: systemd
+
+- name: Disable selinux permanently
+  selinux:
+    state: disabled
+    update_kernel_param: true
+
+- name: Disable firewalld permanently
+  systemd_service:
+    name: firewalld
+    state: stopped
+    enabled: false
+
+- name: Check if swap is disabled for runtime
+  lineinfile: 
+    path: /proc/swaps
+    regex: '/dev'
+    state: absent
+  check_mode: true
+  register: swap_config_check
+  changed_when: false
+
+- name: Set variable to disable swap at runtime
+  set_fact:
+    swap_enabled: "{{ false if swap_config_check.found == 0 else true }}"
+  changed_when: false
+
+- name: Disable swap | with swapoff
+  command: swapoff -a -v
+  register: swapoff_output
+  when: swap_enabled
+
+- name: Disable swap | in fstab file
+  replace:
+    path: /etc/fstab
+    regexp: '^/.*swap'
+    replace: '^#/.*swap'
+
+- name: Update
+  dnf:
+    name: "*"
+    state: latest
+
+- name: Load modules permanently
+  modprobe:
+    name: "{{ item }}"
+    state: present
+    persistent: present
+  with_items: "{{ kubernetes_linux_kernel_modules }}"
+
+- name: Configure sysctl permanently
+  sysctl:
+    name: "{{ item.name}}"
+    value: "{{ item.value }}"
+    sysctl_set: true
+    state: present
+    reload: true
+  with_items: "{{ kubernetes_linux_network_options }}"
+
+- name: Add repositories
+  yum_repository:
+    name: "{{ item.name }}"
+    description: "{{ item.description }}"
+    baseurl: "{{ item.baseurl }}"
+    gpgkey: "{{ item.gpgkey }}"
+    exclude: "{{ item.exclude }}"
+    gpgcheck: yes
+    repo_gpgcheck: yes
+  with_items: "{{ kubernetes_yum_repositories }}"
+    
+- name: Update
+  dnf:
+    name: "*"
+    state: latest
+
+- name: Install containerd, jq, kubelet, kubeadm, kubectl
+  dnf:
+    name: "{{ item.name }}"
+    disable_excludes: "{{ item.disable_excludes }}"
+    state: latest
+  with_items: "{{ kubernetes_packages }}"
+
+- name: Check if containerd reconfiguration is needed
+  lineinfile: 
+    path: /etc/containerd/config.toml
+    regexp: '^.*disabled_plugins = \[.*\"cri\".*'
+    state: absent
+  check_mode: true
+  register: containerd_config_check
+  changed_when: false
+
+- name: Set variable to reconfigure containerd if needed
+  set_fact:
+    containerd_reconfigure: "{{ false if containerd_config_check.found == 0 else true }}"
+  changed_when: false
+
+- name: Generate containerd default configuration
+  shell: "containerd config default > /etc/containerd/config.toml"
+  when: containerd_reconfigure
+
+- name: Set systemd cgroup for runc
+  replace:
+    path: /etc/containerd/config.toml
+    regexp: 'SystemdCgroup = false'
+    replace: 'SystemdCgroup = true'
+  when: containerd_reconfigure
+
+- name: Start containerd and kubelet
+  systemd_service:
+    name: "{{ item.name }}"
+    state: "{{ item.state }}"
+    enabled: true
+  with_items: "{{ kubernetes_services }}"
+
+- name: Restart containerd
+  systemd_service:
+    name: containerd
+    state: restarted
+  when: containerd_reconfigure
+...
